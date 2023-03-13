@@ -14,6 +14,12 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <sentencepiece_processor.h>
+
+
+//Tokenizer object
+sentencepiece::SentencePieceProcessor processor;
+
 #define ANSI_COLOR_RED     "\x1b[31m"
 #define ANSI_COLOR_GREEN   "\x1b[32m"
 #define ANSI_COLOR_YELLOW  "\x1b[33m"
@@ -758,6 +764,11 @@ void sigint_handler(int signo) {
 }
 
 int main(int argc, char ** argv) {
+    const auto status = processor.Load("models/tokenizer.model");
+    if (!status.ok()) {
+       printf("%s", status.ToString().c_str());
+       // error
+    }
     ggml_time_init();
     const int64_t t_main_start_us = ggml_time_us();
 
@@ -807,12 +818,14 @@ int main(int argc, char ** argv) {
     std::vector<float> logits;
 
     // tokenize the prompt
-    std::vector<gpt_vocab::id> embd_inp = ::llama_tokenize(vocab, params.prompt, true);
+    std::vector<gpt_vocab::id> embd_inp;
+    processor.Encode(params.prompt, &embd_inp);
 
     params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
 
     // tokenize the reverse prompt
-    std::vector<gpt_vocab::id> antiprompt_inp = ::llama_tokenize(vocab, params.antiprompt, false);
+    std::vector<gpt_vocab::id> antiprompt_inp;
+    processor.Encode(params.antiprompt, &antiprompt_inp);
 
     printf("\n");
     printf("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
@@ -843,6 +856,8 @@ int main(int argc, char ** argv) {
     printf("\n\n");
 
     std::vector<gpt_vocab::id> embd;
+    std::vector<gpt_vocab::id> all_tokens;
+    std::string full_text = "";
 
     // determine the required inference memory per token:
     size_t mem_per_token = 0;
@@ -869,6 +884,7 @@ int main(int argc, char ** argv) {
         is_interacting = true;
     }
 
+    // set the color for the prompt which will be output initially
     if (params.use_color) {
         printf(ANSI_COLOR_YELLOW);
     }
@@ -890,7 +906,7 @@ int main(int argc, char ** argv) {
         embd.clear();
 
         if (embd_inp.size() <= input_consumed) {
-            // out of input, sample next token
+            // out of user input, sample next token
             const float top_k = params.top_k;
             const float top_p = params.top_p;
             const float temp  = params.temp;
@@ -907,6 +923,7 @@ int main(int argc, char ** argv) {
 
                 last_n_tokens.erase(last_n_tokens.begin());
                 last_n_tokens.push_back(id);
+                all_tokens.push_back(id);
 
                 t_sample_us += ggml_time_us() - t_start_sample_us;
             }
@@ -920,28 +937,43 @@ int main(int argc, char ** argv) {
             // decrement remaining sampling budget
             --remaining_tokens;
         } else {
-            // if here, it means we are still processing the input prompt
+            // some user input remains from prompt or interaction, forward it to processing
             while (embd_inp.size() > input_consumed) {
                 embd.push_back(embd_inp[input_consumed]);
                 last_n_tokens.erase(last_n_tokens.begin());
                 last_n_tokens.push_back(embd_inp[input_consumed]);
+                all_tokens.push_back(embd_inp[input_consumed]);
                 ++input_consumed;
                 if (embd.size() > params.n_batch) {
                     break;
                 }
             }
-
-            if (params.use_color && embd_inp.size() <= input_consumed) {
-                printf(ANSI_COLOR_RESET);
-            }
         }
 
         // display text
         if (!input_noecho) {
-            for (auto id : embd) {
-                printf("%s", vocab.id_to_token[id].c_str());
+            // check if last token is unprintable token
+            std::string check;
+            std::vector<gpt_vocab::id> check_token;
+            check_token.push_back(all_tokens.at(all_tokens.size()-1));
+            processor.Decode(check_token, &check);
+            if(check != "�") { 
+                // If the token is printable we wont attempt to print unprintable tokens
+                std::string text;
+                processor.Decode(all_tokens, &text);
+                if(full_text.length() < text.length()) {
+                    std::string chunk = text.substr(full_text.length());
+                    printf("%s", chunk.c_str());
+                    full_text.empty();
+                    processor.Decode(all_tokens, &full_text);                    
+                    // reset color to default if we there is no pending user input
+                    if (params.use_color && embd_inp.size() <= input_consumed) {
+                        printf(ANSI_COLOR_RESET);
+                    }
+                    fflush(stdout);
+                }
+
             }
-            fflush(stdout);
         }
 
         // in interactive mode, and not currently processing queued inputs;
@@ -972,7 +1004,8 @@ int main(int argc, char ** argv) {
                         buf[n_read+1] = 0;
                     }
 
-                    std::vector<gpt_vocab::id> line_inp = ::llama_tokenize(vocab, buf, false);
+                    std::vector<gpt_vocab::id> line_inp;
+                    processor.Encode(buf, &antiprompt_inp);
                     embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
 
                     input_noecho = true; // do not echo this again
